@@ -1,26 +1,67 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Set the URL of the Framer page
-URL="https://rbconcretelevel.framer.website/"
+# Inputs via env (set in Jenkinsfile)
+SCRAPE_URL="${SCRAPE_URL:-https://rbconcretelevel.framer.website/}"
 
-# Directory where the files will be saved
-WORKDIR="/home/jenkins/scraped-site"
+WORKSPACE="$(pwd)"
+TMPDIR="${WORKSPACE}/.scrape_tmp"
 
-# Create the working directory if it doesn't exist
-mkdir -p $WORKDIR
+echo "[run_scrape] Workspace: ${WORKSPACE}"
+echo "[run_scrape] URL: ${SCRAPE_URL}"
 
-# Use wget to scrape the page
-wget --mirror --page-requisites --adjust-extension --convert-links --no-parent -P $WORKDIR $URL
+rm -rf "${TMPDIR}"
+mkdir -p "${TMPDIR}"
 
-# If there are any changes, copy the files and commit them
-cd $WORKDIR
+# Try to ensure wget exists (best effort; if not, the step will fail and you can install it on the agent)
+if ! command -v wget >/dev/null 2>&1; then
+  echo "[run_scrape] wget not found. Please install wget on the Jenkins agent."
+  exit 1
+fi
 
-# Copy files to the repo directory (assuming your repo is set up)
-cp -a $WORKDIR/* /var/lib/jenkins/workspace/Framer_Scraper/
+echo "[run_scrape] Mirroring site with wget..."
+# Notes:
+# --mirror           recursive + timestamps
+# --page-requisites  get all assets (CSS/JS/images)
+# --adjust-extension add .html to “directory” pages
+# --convert-links    make links local
+# --no-parent        don’t go above start path
+# -nH/--no-host-directories keep flat structure
+# --directory-prefix write into ${TMPDIR}
+wget \
+  --mirror \
+  --page-requisites \
+  --adjust-extension \
+  --convert-links \
+  --no-parent \
+  --no-host-directories -nH \
+  --directory-prefix="${TMPDIR}" \
+  "${SCRAPE_URL}"
 
-# Go back to repo directory and check git status
-cd /var/lib/jenkins/workspace/Framer_Scraper/
+# At this point ${TMPDIR} contains the mirrored site (index.html, assets, etc.)
 
-# Check git status and commit any changes
-git add -A
-git commit -m "Scraped Framer Site Content" || echo "No changes to commit"
+# Sync into workspace root while preserving repo files we need to keep
+# Prefer rsync if available for a clean --delete sync
+if command -v rsync >/dev/null 2>&1; then
+  echo "[run_scrape] rsync --delete into workspace (preserving .git, Jenkins and script files)"
+  rsync -a --delete \
+    --exclude='.git/' \
+    --exclude='.gitignore' \
+    --exclude='.gitattributes' \
+    --exclude='Jenkinsfile' \
+    --exclude='run_scrape.sh' \
+    "${TMPDIR}/" "${WORKSPACE}/"
+else
+  echo "[run_scrape] rsync not found; using basic copy (may leave stale files)"
+  shopt -s dotglob
+  # Remove everything except .git, Jenkinsfile, run_scrape.sh
+  for item in "${WORKSPACE}"/*; do
+    base="$(basename "$item")"
+    if [ "$base" != ".git" ] && [ "$base" != "Jenkinsfile" ] && [ "$base" != "run_scrape.sh" ]; then
+      rm -rf "$item"
+    fi
+  done
+  cp -a "${TMPDIR}/." "${WORKSPACE}/"
+fi
+
+echo "[run_scrape] Done."
